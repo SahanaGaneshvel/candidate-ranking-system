@@ -1,0 +1,33 @@
+# Dataset and large files
+data/
+cache/
+models/
+*.npy
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Output
+submission.csv
+*.csv
+!data/sample_submission.csv

@@ -1,0 +1,12 @@
+# Core dependencies with pinned versions
+sentence-transformers==3.0.1
+transformers==4.44.2
+torch==2.4.0
+numpy==1.26.4
+python-docx==1.1.2
+
+# Implicit dependencies (pinned for reproducibility)
+huggingface-hub==0.24.6
+tokenizers==0.19.1
+safetensors==0.4.4
+tqdm==4.66.5

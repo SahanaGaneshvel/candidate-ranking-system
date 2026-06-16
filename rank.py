@@ -7,8 +7,10 @@ This script:
   2. Reads job description from .docx, embeds with query prefix
   3. Loads precomputed candidate embeddings
   4. Computes semantic similarity scores
-  5. Applies honeypot detection to filter suspicious candidates
-  6. Outputs top 100 ranked candidates to submission.csv
+  5. Applies structured feature scoring (title, ML experience, etc.)
+  6. Applies honeypot detection to filter suspicious candidates
+  7. Combines scores with behavioral modifiers
+  8. Outputs top 100 ranked candidates to submission.csv
 
 Hard constraints:
   - Must run in under 5 minutes
@@ -22,7 +24,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any, Set
 
 import numpy as np
 
@@ -34,6 +36,7 @@ from docx import Document as DocxDocument
 from sentence_transformers import SentenceTransformer
 
 from honeypot import detect_honeypot
+from src.score import rank_candidates_with_scores, generate_reasoning
 
 
 # BGE query prefix for retrieval tasks
@@ -55,15 +58,16 @@ def load_job_description(docx_path: str) -> str:
     return "\n".join(paragraphs)
 
 
-def stream_candidates_for_honeypot(jsonl_path: Path) -> Dict[str, Dict[str, Any]]:
+def stream_candidates(jsonl_path: Path, limit_to_ids: Set[str] = None) -> Dict[str, Dict[str, Any]]:
     """
     Stream candidates and return a dict mapping candidate_id to full record.
 
-    We need the full record for honeypot detection and reasoning generation.
+    We need the full record for feature scoring and reasoning generation.
     Streams to avoid memory spike from json.load() on full file.
 
     Args:
         jsonl_path: Path to candidates.jsonl
+        limit_to_ids: If provided, only load candidates with these IDs
 
     Returns:
         Dict mapping candidate_id to candidate record
@@ -77,48 +81,9 @@ def stream_candidates_for_honeypot(jsonl_path: Path) -> Dict[str, Dict[str, Any]
             candidate = json.loads(line)
             candidate_id = candidate.get("candidate_id", candidate.get("id", ""))
             if candidate_id:
-                candidates[candidate_id] = candidate
+                if limit_to_ids is None or candidate_id in limit_to_ids:
+                    candidates[candidate_id] = candidate
     return candidates
-
-
-def generate_reasoning(candidate: Dict[str, Any], score: float) -> str:
-    """
-    Generate a simple grounded one-liner reasoning from real candidate fields.
-
-    Args:
-        candidate: Full candidate record
-        score: Semantic similarity score
-
-    Returns:
-        Human-readable reasoning string
-    """
-    profile = candidate.get("profile", {}) or {}
-
-    # Extract key fields
-    years_exp = profile.get("years_of_experience")
-    current_title = profile.get("current_title", "").strip()
-    current_company = profile.get("current_company", "").strip()
-
-    parts = []
-
-    # Add current role info
-    if current_title:
-        if current_company:
-            parts.append(f"{current_title} at {current_company}")
-        else:
-            parts.append(current_title)
-
-    # Add experience
-    if years_exp is not None:
-        parts.append(f"{years_exp} years experience")
-
-    # Add score
-    parts.append(f"similarity score {score:.3f}")
-
-    if parts:
-        return "; ".join(parts)
-    else:
-        return f"Semantic similarity score: {score:.3f}"
 
 
 def rank_candidates(
@@ -133,9 +98,11 @@ def rank_candidates(
     """
     Rank candidates against job description and output submission.csv.
 
+    Uses combined semantic + structured scoring with behavioral modifiers.
+
     Args:
         jd_path: Path to job description .docx
-        candidates_path: Path to candidates.jsonl (for honeypot detection)
+        candidates_path: Path to candidates.jsonl (for feature scoring)
         embeddings_path: Path to precomputed embeddings .npy
         ids_path: Path to candidate IDs .npy
         model_path: Path to saved BGE model
@@ -170,56 +137,53 @@ def rank_candidates(
     print(f"Loading candidate embeddings from: {embeddings_path}")
     embed_start = time.time()
     candidate_embeddings = np.load(embeddings_path)
-    candidate_ids = np.load(ids_path, allow_pickle=True)
+    candidate_ids_array = np.load(ids_path, allow_pickle=True)
+    candidate_ids = [str(cid) for cid in candidate_ids_array]
     print(f"Loaded {len(candidate_ids):,} candidate embeddings in {time.time() - embed_start:.2f}s")
     print(f"Embeddings shape: {candidate_embeddings.shape}")
 
     # Compute semantic similarity scores (dot product of normalized vectors = cosine sim)
     print("Computing semantic similarity scores...")
     score_start = time.time()
-    scores = candidate_embeddings @ jd_vec
+    semantic_scores = candidate_embeddings @ jd_vec
     print(f"Scores computed in {time.time() - score_start:.4f}s")
 
-    # Create candidate_id -> score mapping
-    id_to_score: Dict[str, float] = {}
-    id_to_index: Dict[str, int] = {}
-    for i, cid in enumerate(candidate_ids):
-        cid_str = str(cid)
-        id_to_score[cid_str] = float(scores[i])
-        id_to_index[cid_str] = i
+    # Load full candidate records for feature scoring
+    # Only load candidates we have embeddings for
+    embedded_ids = set(candidate_ids)
+    print(f"Loading candidate records from: {candidates_path}")
+    load_start = time.time()
+    candidates = stream_candidates(Path(candidates_path), limit_to_ids=embedded_ids)
+    print(f"Loaded {len(candidates):,} candidate records in {time.time() - load_start:.2f}s")
 
-    # Load full candidate records for honeypot detection
-    print(f"Loading candidates for honeypot detection from: {candidates_path}")
-    hp_start = time.time()
-    candidates = stream_candidates_for_honeypot(Path(candidates_path))
-    print(f"Loaded {len(candidates):,} candidates in {time.time() - hp_start:.2f}s")
-
-    # Run honeypot detection and set flagged candidates' score to -inf
+    # Run honeypot detection
     print("Running honeypot detection...")
     honeypot_start = time.time()
-    honeypot_count = 0
-    honeypot_reasons: Dict[str, List[str]] = {}
+    honeypot_ids: Set[str] = set()
 
     for cid, candidate in candidates.items():
         is_honeypot, reasons, details = detect_honeypot(candidate)
         if is_honeypot:
-            honeypot_count += 1
-            honeypot_reasons[cid] = reasons
-            if cid in id_to_score:
-                id_to_score[cid] = float("-inf")
+            honeypot_ids.add(cid)
 
     print(f"Honeypot detection completed in {time.time() - honeypot_start:.2f}s")
-    print(f"Flagged {honeypot_count:,} honeypot candidates")
+    print(f"Flagged {len(honeypot_ids):,} honeypot candidates")
 
-    # Sort by score descending, then by candidate_id ascending for ties
-    print("Sorting candidates...")
-    sorted_candidates: List[Tuple[str, float]] = sorted(
-        id_to_score.items(),
-        key=lambda x: (-x[1], x[0])  # -score for descending, id for ascending tie-break
+    # Run combined scoring (semantic + structured + behavioral)
+    print("Computing structured feature scores...")
+    feature_start = time.time()
+
+    ranked_results = rank_candidates_with_scores(
+        candidate_ids=candidate_ids,
+        semantic_scores=semantic_scores,
+        candidates=candidates,
+        honeypot_ids=honeypot_ids,
     )
 
+    print(f"Feature scoring completed in {time.time() - feature_start:.2f}s")
+
     # Take top K
-    top_candidates = sorted_candidates[:top_k]
+    top_results = ranked_results[:top_k]
 
     # Generate output
     print(f"Generating {output_path}...")
@@ -227,9 +191,9 @@ def rank_candidates(
         writer = csv.writer(f)
         writer.writerow(["candidate_id", "rank", "score", "reasoning"])
 
-        for rank, (cid, score) in enumerate(top_candidates, start=1):
+        for rank, (cid, score, breakdown) in enumerate(top_results, start=1):
             candidate = candidates.get(cid, {})
-            reasoning = generate_reasoning(candidate, score)
+            reasoning = generate_reasoning(candidate, breakdown)
             writer.writerow([cid, rank, f"{score:.6f}", reasoning])
 
     total_time = time.time() - total_start
@@ -239,22 +203,43 @@ def rank_candidates(
     print(f"Total elapsed time: {total_time:.2f}s")
     print(f"Output written to: {output_path}")
     print(f"Top {top_k} candidates ranked")
-    print(f"Honeypots filtered: {honeypot_count:,}")
+    print(f"Honeypots filtered: {len(honeypot_ids):,}")
 
-    # Print top 20 for visual inspection
+    # Print top 20 for visual inspection with detailed breakdown
     print(f"\n{'='*60}")
     print("TOP 20 CANDIDATES")
     print(f"{'='*60}")
-    print(f"{'Rank':<6}{'Candidate ID':<20}{'Score':<12}{'Title'}")
-    print("-" * 70)
+    print(f"{'Rank':<5}{'ID':<15}{'Score':<8}{'Sem':<6}{'ML':<5}{'Title':<25}{'Concern'}")
+    print("-" * 90)
 
-    for rank, (cid, score) in enumerate(top_candidates[:20], start=1):
+    for rank, (cid, score, breakdown) in enumerate(top_results[:20], start=1):
         candidate = candidates.get(cid, {})
         profile = candidate.get("profile", {}) or {}
         title = profile.get("current_title", "N/A")
-        if len(title) > 30:
-            title = title[:27] + "..."
-        print(f"{rank:<6}{cid:<20}{score:<12.4f}{title}")
+        if len(title) > 23:
+            title = title[:20] + "..."
+
+        sem_score = breakdown.get("semantic_normalized", 0)
+        ml_score = breakdown.get("real_ml_experience", 0)
+        penalties = breakdown.get("penalty_reasons", [])
+        concern = penalties[0][:20] + "..." if penalties else "-"
+
+        print(f"{rank:<5}{cid:<15}{score:<8.3f}{sem_score:<6.2f}{ml_score:<5.2f}{title:<25}{concern}")
+
+    # Show score distribution
+    print(f"\n{'='*60}")
+    print("SCORE BREAKDOWN (Top 20)")
+    print(f"{'='*60}")
+    print(f"{'ID':<15}{'Final':<7}{'Semantic':<9}{'Struct':<8}{'Behav':<6}{'Penalty'}")
+    print("-" * 55)
+
+    for rank, (cid, score, breakdown) in enumerate(top_results[:20], start=1):
+        sem = breakdown.get("semantic_contribution", 0)
+        struct = breakdown.get("structured_contribution", 0)
+        behav = breakdown.get("behavioral_modifier", 1.0)
+        penalty = breakdown.get("penalties", 0)
+
+        print(f"{cid:<15}{score:<7.3f}{sem:<9.3f}{struct:<8.3f}{behav:<6.2f}{penalty:<.3f}")
 
     print(f"\n{'='*60}")
 

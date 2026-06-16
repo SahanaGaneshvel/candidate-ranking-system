@@ -31,15 +31,31 @@ WEAK_POSITIVE_TITLES: Set[str] = {
     "technical lead", "tech lead", "architect",
 }
 
-# JD explicitly says these are NOT fits
+# JD explicitly says these are NOT fits - non-engineering/non-ML roles
 IRRELEVANT_TITLES: Set[str] = {
-    "hr manager", "human resources", "content writer", "copywriter",
-    "mechanical engineer", "civil engineer", "electrical engineer",
-    "sales executive", "sales manager", "marketing manager",
-    "accountant", "finance manager", "operations manager",
+    # HR/Admin roles
+    "hr manager", "human resources", "recruiter", "talent acquisition",
+    # Content/Creative roles
+    "content writer", "copywriter", "technical writer",
     "graphic designer", "ui designer", "ux designer",
-    "customer support", "customer success", "project manager",
+    # Non-software engineering
+    "mechanical engineer", "civil engineer", "electrical engineer",
+    "chemical engineer", "structural engineer",
+    # Sales/Marketing/Business
+    "sales executive", "sales manager", "marketing manager",
+    "business development", "account manager", "account executive",
+    # Finance/Operations
+    "accountant", "finance manager", "operations manager",
+    "supply chain", "logistics",
+    # Support/Service roles
+    "customer support", "customer success", "support engineer",
+    # Management without tech depth
+    "project manager", "program manager", "scrum master",
     "product manager",  # PM can be relevant but title alone isn't enough
+    # QA without ML focus
+    "qa engineer", "qa analyst", "quality assurance", "test engineer",
+    # Specialized non-ML dev roles
+    "java developer", ".net developer", "php developer",
 }
 
 # --- Experience Fit (from JD: "5-9 years", peak at 6-8) ---

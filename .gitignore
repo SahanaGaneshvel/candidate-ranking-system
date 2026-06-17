@@ -31,3 +31,5 @@ Thumbs.db
 submission.csv
 *.csv
 !data/sample_submission.csv
+!eval/devset_template.csv
+!eval/devset.csv

@@ -283,19 +283,39 @@ def score_real_ml_experience(candidate: Dict[str, Any]) -> Tuple[float, str]:
         return 0.25, "minimal ML evidence"
 
 
+def _get_years_of_experience(candidate: Dict[str, Any]) -> float:
+    """
+    Get years of experience from career history (more reliable than profile field).
+
+    The profile.years_of_experience field can be inconsistent with actual
+    career history. We use career history duration_months as source of truth.
+    """
+    career_history = candidate.get("career_history", []) or []
+
+    if not career_history:
+        # Fall back to profile field if no career history
+        profile = candidate.get("profile", {}) or {}
+        return float(profile.get("years_of_experience", 0) or 0)
+
+    total_months = sum(
+        job.get("duration_months", 0) or 0
+        for job in career_history
+    )
+    return total_months / 12
+
+
 def score_experience_fit(candidate: Dict[str, Any]) -> Tuple[float, str]:
     """
     Score based on years of experience.
 
     JD: "5-9 years", with ideal being 6-8 years.
+
+    Uses career history duration as source of truth (profile field can be inconsistent).
     """
-    profile = candidate.get("profile", {}) or {}
-    yoe = profile.get("years_of_experience")
+    yoe = _get_years_of_experience(candidate)
 
-    if yoe is None:
+    if yoe == 0:
         return 0.5, "experience not specified"
-
-    yoe = float(yoe)
 
     # Peak score for 6-8 years
     if EXPERIENCE_PEAK_MIN <= yoe <= EXPERIENCE_PEAK_MAX:

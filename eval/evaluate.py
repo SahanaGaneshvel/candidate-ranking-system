@@ -398,17 +398,17 @@ def main():
         for line in f:
             c = json.loads(line)
             cid = c.get("candidate_id", "")
-            if cid in labeled_ids or cid in set(candidate_ids):
+            if cid in labeled_ids:
                 candidates[cid] = c
 
     print(f"Loaded {len(candidates)} candidate records")
 
-    # Compute feature scores for all candidates (cache for sweep)
+    # Compute feature scores only for labeled candidates (sufficient for eval)
     print("Computing feature scores (caching)...")
     from src.features import score_features
 
     feature_cache = {}
-    for cid in candidate_ids:
+    for cid in labeled_ids:
         if cid in candidates:
             feature_cache[cid] = score_features(candidates[cid])
 

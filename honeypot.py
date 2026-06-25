@@ -7,9 +7,32 @@ that indicate fake/fraudulent data.
 IMPORTANT: Behavioral signals (response rate, interview completion, activity)
 are NEVER honeypot criteria - they are handled separately as ranking modifiers.
 Honeypot detection only flags profiles that are impossible, not just undesirable.
+
+This module uses exactly four validated arithmetic checks:
+1. Timeline-span gap: years_of_experience vs career span mismatch
+2. Role duration mismatch: duration_months vs (end_date - start_date) inconsistency
+3. Expert-with-zero-time: advanced/expert skills with 0 duration_months
+4. Documented-experience gap: years_of_experience vs sum of role durations
 """
 
+from datetime import datetime
 from typing import Any, Tuple, List, Dict
+
+
+def _parse_date(date_str: str) -> datetime | None:
+    """Parse date string to datetime, returning None if invalid."""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _months_between(start: datetime, end: datetime) -> float:
+    """Calculate months between two dates."""
+    delta = end - start
+    return delta.days / 30.44  # Average days per month
 
 
 def detect_honeypot(candidate: dict) -> Tuple[bool, List[str], Dict[str, Any]]:
@@ -34,61 +57,124 @@ def detect_honeypot(candidate: dict) -> Tuple[bool, List[str], Dict[str, Any]]:
     profile = candidate.get("profile", {}) or {}
     career_history = candidate.get("career_history", []) or []
     skills = candidate.get("skills", []) or []
-    education = candidate.get("education", []) or []
 
-    # === Arithmetic impossibility checks only ===
-
-    # Check 1: Impossible years of experience (schema max is 50)
     yoe = profile.get("years_of_experience")
-    if yoe is not None and yoe > 50:
-        reasons.append(f"Impossible years of experience: {yoe}")
-        details["impossible_yoe"] = yoe
 
-    # Check 2: Negative years of experience
-    if yoe is not None and yoe < 0:
-        reasons.append(f"Negative years of experience: {yoe}")
-        details["negative_yoe"] = yoe
+    # =========================================================================
+    # Check 1: Timeline-span gap
+    # career_span = (latest end_date - earliest start_date) in years
+    # Flag if years_of_experience - career_span > 1.5
+    # =========================================================================
+    if yoe is not None and len(career_history) > 0:
+        start_dates = []
+        end_dates = []
 
-    # Check 3: Career history exceeds schema limit (max 10 per schema)
-    if len(career_history) > 10:
-        reasons.append(f"Career history exceeds schema limit: {len(career_history)} > 10")
-        details["career_history_count"] = len(career_history)
+        for job in career_history:
+            start = _parse_date(job.get("start_date"))
+            if start:
+                start_dates.append(start)
 
-    # Check 4: Education exceeds schema limit (max 5 per schema)
-    if len(education) > 5:
-        reasons.append(f"Education exceeds schema limit: {len(education)} > 5")
-        details["education_count"] = len(education)
+            end = _parse_date(job.get("end_date"))
+            if end:
+                end_dates.append(end)
+            elif job.get("is_current"):
+                end_dates.append(datetime.now())
 
-    # Check 5: Career history with impossible duration
+        if start_dates and end_dates:
+            earliest_start = min(start_dates)
+            latest_end = max(end_dates)
+            career_span = _months_between(earliest_start, latest_end) / 12
+
+            gap = yoe - career_span
+            if gap > 1.5:
+                reasons.append(
+                    f"Timeline-span gap: claims {yoe:.1f} yrs but career spans {career_span:.1f} yrs (gap: {gap:.1f})"
+                )
+                details["timeline_gap"] = {
+                    "claimed_yoe": yoe,
+                    "career_span": career_span,
+                    "gap": gap
+                }
+
+    # =========================================================================
+    # Check 2: Role duration mismatch
+    # For each role, flag if abs(duration_months - months_between(start, end)) > 3
+    # =========================================================================
+    duration_mismatches = []
     for i, job in enumerate(career_history):
-        duration = job.get("duration_months")
-        if duration is not None and duration < 0:
-            reasons.append(f"Negative job duration in career_history[{i}]: {duration}")
-            details["negative_duration"] = duration
+        duration_months = job.get("duration_months")
+        if duration_months is None:
+            continue
 
-    # Check 6: Skills with impossible duration
-    for i, skill in enumerate(skills):
+        start = _parse_date(job.get("start_date"))
+        end = _parse_date(job.get("end_date"))
+
+        if not start:
+            continue
+
+        if not end and job.get("is_current"):
+            end = datetime.now()
+
+        if end:
+            computed_months = _months_between(start, end)
+            diff = abs(duration_months - computed_months)
+
+            if diff > 3:
+                duration_mismatches.append({
+                    "role_index": i,
+                    "title": job.get("title", "Unknown"),
+                    "claimed": duration_months,
+                    "computed": computed_months,
+                    "diff": diff
+                })
+
+    if duration_mismatches:
+        reasons.append(
+            f"Role duration mismatch: {len(duration_mismatches)} role(s) have duration_months inconsistent with dates"
+        )
+        details["duration_mismatches"] = duration_mismatches
+
+    # =========================================================================
+    # Check 3: Expert-with-zero-time
+    # Flag if count of skills with proficiency in {advanced, expert} AND
+    # duration_months == 0 is >= 3
+    # =========================================================================
+    expert_zero_skills = []
+    for skill in skills:
+        proficiency = (skill.get("proficiency") or "").lower()
         duration = skill.get("duration_months")
-        if duration is not None and duration < 0:
-            reasons.append(f"Negative skill duration: {skill.get('name', 'unknown')}")
-            details["negative_skill_duration"] = duration
-            break  # One is enough to flag
 
-    # Check 7: Experience years inconsistent with career history
-    # If claimed 20+ years but career history sums to <5 years
-    if yoe is not None and yoe > 20:
-        total_career_months = sum(
+        if proficiency in {"advanced", "expert"} and duration == 0:
+            expert_zero_skills.append(skill.get("name", "Unknown"))
+
+    if len(expert_zero_skills) >= 3:
+        reasons.append(
+            f"Expert-with-zero-time: {len(expert_zero_skills)} advanced/expert skills with 0 duration"
+        )
+        details["expert_zero_skills"] = expert_zero_skills
+
+    # =========================================================================
+    # Check 4: Documented-experience gap
+    # sum_dur = sum(role duration_months) / 12
+    # Flag if years_of_experience - sum_dur > 1.5
+    # Note: Only flags INFLATED profiles (yoe > documented), not deflated ones
+    # =========================================================================
+    if yoe is not None and len(career_history) > 0:
+        total_months = sum(
             job.get("duration_months", 0) or 0
             for job in career_history
         )
-        total_career_years = total_career_months / 12
-        if total_career_years < 5 and len(career_history) > 0:
+        sum_dur = total_months / 12
+
+        gap = yoe - sum_dur
+        if gap > 1.5:
             reasons.append(
-                f"Experience mismatch: claims {yoe} years but career history shows {total_career_years:.1f}"
+                f"Documented-experience gap: claims {yoe:.1f} yrs but roles sum to {sum_dur:.1f} yrs (gap: {gap:.1f})"
             )
-            details["experience_mismatch"] = {
-                "claimed": yoe,
-                "documented": total_career_years
+            details["documented_gap"] = {
+                "claimed_yoe": yoe,
+                "documented_yrs": sum_dur,
+                "gap": gap
             }
 
     is_honeypot = len(reasons) > 0
